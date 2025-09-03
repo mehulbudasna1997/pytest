@@ -1,11 +1,28 @@
 import pytest
 from kubernetes import client, config
-
+import os
+from dotenv import load_dotenv
+load_dotenv()
+# -------------------------
+# Fixtures
+# -------------------------
 @pytest.fixture(scope="session")
 def kube_clients():
     """Return CoreV1Api and AppsV1Api clients."""
-    config.load_kube_config()
-    return client.CoreV1Api(), client.AppsV1Api()
+    try:
+        # Respect explicit kubeconfig if provided
+        kubeconfig_path = os.environ.get("KUBECONFIG")
+        if kubeconfig_path:
+            config.load_kube_config(config_file=kubeconfig_path)
+        else:
+            config.load_kube_config()
+    except Exception:
+        # Fall back to in-cluster configuration (when tests run in a Pod)
+        config.load_incluster_config()
+
+    core_v1 = client.CoreV1Api()
+    apps_v1 = client.AppsV1Api()
+    return core_v1, apps_v1
 
 
 # -------------------------
