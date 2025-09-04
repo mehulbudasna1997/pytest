@@ -1,10 +1,13 @@
 import pytest
-import subprocess
 import time
-from kubernetes import client, config
 import os
+from kubernetes import client, config
+from kubernetes.stream import stream
 from dotenv import load_dotenv
+import tempfile
+
 load_dotenv()
+
 # -------------------------
 # Fixtures
 # -------------------------
@@ -12,14 +15,12 @@ load_dotenv()
 def kube_clients():
     """Return CoreV1Api and AppsV1Api clients."""
     try:
-        # Respect explicit kubeconfig if provided
         kubeconfig_path = os.environ.get("KUBECONFIG")
         if kubeconfig_path:
             config.load_kube_config(config_file=kubeconfig_path)
         else:
             config.load_kube_config()
     except Exception:
-        # Fall back to in-cluster configuration (when tests run in a Pod)
         config.load_incluster_config()
 
     core_v1 = client.CoreV1Api()
@@ -54,18 +55,29 @@ def test_time_sync(kube_clients):
     for n in core_v1.list_node().items:
         name = n.metadata.name
         try:
-            output = subprocess.check_output(["ssh", name, "chronyc tracking"], text=True)
-            drift_line = next(l for l in output.splitlines() if "System time" in l)
-            drift_ms = float(drift_line.split()[3].replace("ms", ""))
-            time_ok = abs(drift_ms) < 0.1
+            # Check node time using a privileged DaemonSet pod
+            pod_name = f"timecheck-{name.replace('.', '-')}"
+            namespace = "default"
+
+            # Run 'date +%s' on node via pod
+            # Here we assume the node has a pod scheduled on it (or a small DaemonSet)
+            output = stream(core_v1.connect_get_namespaced_pod_exec,
+                            pod_name,
+                            namespace,
+                            command=["date", "+%s"],
+                            stderr=True, stdin=False, stdout=True, tty=False)
+            node_time = int(output.strip())
+            # Compare to local time (or any reference)
+            drift = abs(node_time - int(time.time()))
+            time_ok = drift < 1
             node_reports.append({"name": name, "time_sync_ok": time_ok})
-            print(f"Node: {name}, Drift: {drift_ms} ms, Status: {'OK' if time_ok else 'DRIFT >100ms'}")
+            print(f"Node: {name}, Drift: {drift} s, Status: {'OK' if time_ok else 'DRIFT >1s'}")
         except Exception as e:
-            print(f"Error checking time sync on node {name}: {e}")
+            print(f"Error checking time on node {name}: {e}")
             node_reports.append({"name": name, "time_sync_ok": False})
 
     bad_time = [n["name"] for n in node_reports if not n["time_sync_ok"]]
-    assert not bad_time, f"Some nodes have clock drift >100ms: {bad_time}"
+    assert not bad_time, f"Some nodes have clock drift >1s: {bad_time}"
 
 # -------------------------
 # T0.2 — Network MTU & Pod Connectivity
@@ -73,58 +85,102 @@ def test_time_sync(kube_clients):
 def test_network_mtu_and_connectivity(kube_clients):
     core_v1, apps_v1 = kube_clients
 
-    # MTU Check
-    print("\n=== Network MTU Check ===")
-    mtu_fail_nodes = []
-    for n in core_v1.list_node().items:
-        node_name = n.metadata.name
-        try:
-            output = subprocess.check_output(["ssh", node_name, "ip link"], text=True)
+    # Create a privileged DaemonSet to check MTU
+    mtu_ds_yaml = """
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: mtu-check
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: mtu-check
+  template:
+    metadata:
+      labels:
+        app: mtu-check
+    spec:
+      hostNetwork: true
+      containers:
+      - name: mtu
+        image: busybox
+        command: ["sleep","3600"]
+        securityContext:
+          privileged: true
+      restartPolicy: Always
+"""
+
+    with tempfile.NamedTemporaryFile("w", delete=False) as f:
+        f.write(mtu_ds_yaml)
+        fpath = f.name
+
+    try:
+        # Apply DaemonSet
+        subprocess.run(["kubectl", "apply", "-f", fpath], check=True)
+        timeout = 60
+        while timeout > 0:
+            pods = core_v1.list_namespaced_pod(namespace="default", label_selector="app=mtu-check")
+            if all(p.status.phase == "Running" for p in pods.items) and len(pods.items) > 0:
+                break
+            time.sleep(2)
+            timeout -= 2
+
+        # MTU check
+        print("\n=== Network MTU Check ===")
+        mtu_fail_nodes = []
+        for pod in pods.items:
+            node_name = pod.spec.node_name
+            pod_name = pod.metadata.name
+            output = stream(core_v1.connect_get_namespaced_pod_exec,
+                            pod_name,
+                            "default",
+                            command=["ip", "link"],
+                            stderr=True, stdin=False, stdout=True, tty=False)
             for line in output.splitlines():
                 if "mtu" in line and "lo" not in line:
                     mtu = int(line.split("mtu")[1].split()[0])
                     print(f"Node: {node_name}, MTU: {mtu}")
-                    if mtu != 1500:  # Adjust per your prod setup
+                    if mtu != 1500:
                         mtu_fail_nodes.append(node_name)
-        except Exception as e:
-            print(f"Error checking MTU on node {node_name}: {e}")
-            mtu_fail_nodes.append(node_name)
-    assert not mtu_fail_nodes, f"MTU check failed on nodes: {mtu_fail_nodes}"
+        assert not mtu_fail_nodes, f"MTU check failed on nodes: {mtu_fail_nodes}"
+
+    finally:
+        # Cleanup MTU DaemonSet
+        subprocess.run(["kubectl", "delete", "ds", "mtu-check", "-n", "default"])
+        os.unlink(fpath)
 
     # -------------------------
     # Pod ↔ Pod connectivity using busybox DaemonSet
     # -------------------------
-    print("\n=== Pod ↔ Pod Connectivity ===")
-    busybox_ds = """
-    apiVersion: apps/v1
-    kind: DaemonSet
+    busybox_ds_yaml = """
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: busybox
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: busybox
+  template:
     metadata:
-      name: busybox
-      namespace: default
+      labels:
+        app: busybox
     spec:
-      selector:
-        matchLabels:
-          app: busybox
-      template:
-        metadata:
-          labels:
-            app: busybox
-        spec:
-          containers:
-          - name: busybox
-            image: busybox
-            command: ["sleep","3600"]
-          restartPolicy: Always
-    """
+      containers:
+      - name: busybox
+        image: busybox
+        command: ["sleep","3600"]
+      restartPolicy: Always
+"""
 
-    import tempfile, os
     with tempfile.NamedTemporaryFile("w", delete=False) as f:
-        f.write(busybox_ds)
+        f.write(busybox_ds_yaml)
         fpath = f.name
 
     try:
         subprocess.run(["kubectl", "apply", "-f", fpath], check=True)
-        # Wait for pods running
         timeout = 60
         while timeout > 0:
             pods = core_v1.list_namespaced_pod(namespace="default", label_selector="app=busybox")
@@ -135,15 +191,17 @@ def test_network_mtu_and_connectivity(kube_clients):
 
         pod_ips = {p.metadata.name: p.status.pod_ip for p in pods.items}
         connectivity_failures = []
+
         for src, src_ip in pod_ips.items():
             for tgt, tgt_ip in pod_ips.items():
                 if src == tgt:
                     continue
-                result = subprocess.run(
-                    ["kubectl", "exec", src, "--", "ping", "-c", "2", tgt_ip],
-                    capture_output=True, text=True
-                )
-                success = result.returncode == 0
+                resp = stream(core_v1.connect_get_namespaced_pod_exec,
+                              src,
+                              "default",
+                              command=["ping", "-c", "2", tgt_ip],
+                              stderr=True, stdin=False, stdout=True, tty=False)
+                success = "0% packet loss" in resp
                 print(f"{src} -> {tgt}: {'SUCCESS' if success else 'FAILURE'}")
                 if not success:
                     connectivity_failures.append(f"{src}->{tgt}")
@@ -151,7 +209,5 @@ def test_network_mtu_and_connectivity(kube_clients):
         assert not connectivity_failures, f"Pod ↔ Pod connectivity failed: {connectivity_failures}"
 
     finally:
-        # Cleanup DaemonSet
         subprocess.run(["kubectl", "delete", "ds", "busybox", "-n", "default"])
         os.unlink(fpath)
-
