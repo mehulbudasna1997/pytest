@@ -73,26 +73,30 @@ def test_t7_2_secrets_at_rest(kube_client):
     assert "--encryption-provider-config" in manifest, "Encryption provider config not set"
 
 
-
 @pytest.mark.medium
 def test_t7_3_network_policies(kube_client):
     """
-    Purpose:
-        Validate Network Policies enforce least-privilege communication.
-    Preconditions:
-        - Namespace 'test-netpol' with a test pod running (label=app=test-app)
-        - CoreDNS pods running in kube-system namespace
-        - Storage endpoints available (e.g., rook-ceph cluster)
-    Steps:
-        1. Apply a deny-all NetworkPolicy
-        2. Attempt external connectivity (should fail)
-        3. Apply allow rules for CoreDNS and storage endpoints
-        4. Verify allowed traffic works and other traffic is blocked
-    Expected Result:
-        - External traffic blocked by deny-all
-        - CoreDNS and storage traffic explicitly allowed
+    Validate Network Policies enforce least-privilege communication.
     """
     ns = "test-netpol"
+
+    # Ensure namespace exists
+    subprocess.run(["kubectl", "create", "ns", ns], check=False)
+
+    # Ensure pod exists
+    try:
+        pod_name = subprocess.check_output(
+            ["kubectl", "-n", ns, "get", "pod", "-l", "app=test-app",
+             "-o", "jsonpath={.items[0].metadata.name}"],
+            text=True
+        )
+    except subprocess.CalledProcessError:
+        subprocess.run(
+            ["kubectl", "run", "test-app", "--image=busybox", "--restart=Never",
+             "-n", ns, "--labels=app=test-app", "--", "sleep", "3600"],
+            check=True
+        )
+        pod_name = "test-app"
 
     # Step 1: Apply deny-all
     deny_all = """
@@ -110,19 +114,14 @@ def test_t7_3_network_policies(kube_client):
     subprocess.run(["kubectl", "apply", "-f", "-"],
                    input=deny_all, text=True, check=True)
 
-    # Step 2: Attempt external ping (should fail)
-    pod_name = subprocess.check_output(
-        ["kubectl", "-n", ns, "get", "pod", "-l", "app=test-app",
-         "-o", "jsonpath={.items[0].metadata.name}"],
-        text=True
-    )
+    # Step 2: Attempt external ping
+    reachable = True
     try:
         subprocess.run(
             ["kubectl", "-n", ns, "exec", pod_name, "--",
              "ping", "-c", "1", "8.8.8.8"],
             check=True, capture_output=True, text=True, timeout=10
         )
-        reachable = True
     except subprocess.CalledProcessError:
         reachable = False
 
@@ -153,8 +152,22 @@ def test_t7_3_network_policies(kube_client):
     subprocess.run(["kubectl", "apply", "-f", "-"],
                    input=allow_coredns, text=True, check=True)
 
-    # Step 4: Allow storage access
-    allow_storage = """
+    # Step 4: Allow storage access (auto-detect Ceph service)
+    ceph_services = subprocess.check_output(
+        ["kubectl", "-n", "rook-ceph", "get", "svc", "-o", "json"],
+        text=True
+    )
+    svc_json = json.loads(ceph_services)
+    ceph_service = None
+    for svc in svc_json["items"]:
+        if "mon" in svc["metadata"]["name"]:  # pick monitor service
+            ceph_service = f"{svc['metadata']['name']}.{svc['metadata']['namespace']}:{svc['spec']['ports'][0]['port']}"
+            break
+
+    if not ceph_service:
+        pytest.skip("No Ceph monitor service found in rook-ceph namespace")
+
+    allow_storage = f"""
     apiVersion: networking.k8s.io/v1
     kind: NetworkPolicy
     metadata:
@@ -175,16 +188,16 @@ def test_t7_3_network_policies(kube_client):
     subprocess.run(["kubectl", "apply", "-f", "-"],
                    input=allow_storage, text=True, check=True)
 
-    # Step 5: Verify DNS resolution works
+    # Step 5: Verify DNS works
     subprocess.run(
         ["kubectl", "-n", ns, "exec", pod_name, "--",
          "nslookup", "kubernetes.default.svc.cluster.local"],
         check=True, capture_output=True, text=True, timeout=10
     )
 
-    # Step 6: Verify storage access
+    # Step 6: Verify Ceph monitor is reachable
     subprocess.run(
         ["kubectl", "-n", ns, "exec", pod_name, "--",
-         "curl", "-s", "rook-ceph.ceph-cluster:6789"],
+         "nc", "-zv"] + ceph_service.split(":"),
         check=True, capture_output=True, text=True, timeout=10
     )
