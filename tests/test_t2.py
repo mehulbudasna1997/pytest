@@ -3,7 +3,11 @@ import subprocess
 from kubernetes import client, config
 import os
 from dotenv import load_dotenv
+import re
+
 load_dotenv()
+
+
 # -------------------------
 # Fixtures
 # -------------------------
@@ -11,14 +15,12 @@ load_dotenv()
 def kube_clients():
     """Return CoreV1Api and AppsV1Api clients."""
     try:
-        # Respect explicit kubeconfig if provided
         kubeconfig_path = os.environ.get("KUBECONFIG")
         if kubeconfig_path:
             config.load_kube_config(config_file=kubeconfig_path)
         else:
             config.load_kube_config()
     except Exception:
-        # Fall back to in-cluster configuration (when tests run in a Pod)
         config.load_incluster_config()
 
     core_v1 = client.CoreV1Api()
@@ -30,32 +32,40 @@ def kube_clients():
 # T2.1 — Ceph cluster health + master node connectivity
 # -------------------------
 def test_ceph_cluster_health_and_master(kube_clients):
-    """
-    Prod: Run `ceph -s` and verify:
-        - HEALTH_OK
-        - quorum 3/3 MON
-        - MGR active
-        - OSDs up/in
-    Then verify all master nodes are Ready.
-    """
     print("\n=== T2.1 — Ceph Cluster Health (Prod) ===")
     try:
-        # Ceph health
         result = subprocess.run(["ceph", "-s"], capture_output=True, text=True, check=True)
         output = result.stdout
         print(output)
+
+        # HEALTH_OK check
         assert "HEALTH_OK" in output, "Ceph cluster is not HEALTH_OK"
-        assert "quorum 3/3" in output, "MON quorum is not 3/3"
-        assert "mgr: active" in output, "MGR is not active"
-        assert "up," in output and "in" in output, "OSDs are not up/in"
+
+        # MON quorum check
+        mon_match = re.search(r"quorum\s+([\w,]+)", output)
+        assert mon_match, "No quorum info found"
+        mon_list = mon_match.group(1).split(",")
+        assert len(mon_list) == 3, f"MON quorum not 3/3, found: {mon_list}"
+
+        # MGR active check
+        mgr_match = re.search(r"mgr:\s+(\S+)\(active", output)
+        assert mgr_match, "MGR not active"
+
+        # OSD up/in check
+        osd_match = re.search(r"osd:\s+(\d+)\s+up\s+\(\S+\),\s+(\d+)\s+in", output)
+        assert osd_match, "OSDs not up/in"
+
     except subprocess.CalledProcessError as e:
         pytest.fail(f"Failed to run ceph -s: {e}")
 
     # Master node connectivity
     print("\n=== Checking Master Node Connectivity ===")
     core_v1, _ = kube_clients
-    masters = [n.metadata.name for n in core_v1.list_node().items if
-               "control-plane" in n.metadata.labels or "master" in n.metadata.labels]
+    masters = [
+        n.metadata.name
+        for n in core_v1.list_node().items
+        if "control-plane" in n.metadata.labels or "master" in n.metadata.labels
+    ]
 
     not_ready = []
     for m in masters:
@@ -72,37 +82,48 @@ def test_ceph_cluster_health_and_master(kube_clients):
 # T2.2 — Ceph OSD map & distribution + master node ping
 # -------------------------
 def test_ceph_osd_distribution_and_master(kube_clients):
-    """
-    Prod: Run `ceph osd tree` and `ceph df` to verify balanced OSDs,
-    then verify master nodes are pingable via kubernetes API.
-    """
     print("\n=== T2.2 — Ceph OSD Map & DF (Prod) ===")
     try:
-        osd_tree = subprocess.run(["ceph", "osd", "tree"], capture_output=True, text=True, check=True)
-        ceph_df = subprocess.run(["ceph", "df"], capture_output=True, text=True, check=True)
+        osd_tree_res = subprocess.run(["ceph", "osd", "tree"], capture_output=True, text=True, check=True)
+        ceph_df_res = subprocess.run(["ceph", "df"], capture_output=True, text=True, check=True)
 
         print("--- OSD Tree ---")
-        print(osd_tree.stdout)
+        print(osd_tree_res.stdout)
         print("--- Ceph DF ---")
-        print(ceph_df.stdout)
+        print(ceph_df_res.stdout)
 
-        # Basic checks
-        assert "up" in osd_tree.stdout, "Some OSDs are down"
-        assert "in" in osd_tree.stdout, "Some OSDs are out"
-        assert "SIZE" in ceph_df.stdout, "Ceph DF output not found"
+        # Parse OSD tree to ensure all OSDs are up/in
+        osd_lines = [line for line in osd_tree_res.stdout.splitlines() if line.strip().startswith("osd.")]
+        osd_failures = []
+        for line in osd_lines:
+            cols = line.split()
+            if len(cols) < 5:
+                continue
+            osd_name = cols[0]
+            status = cols[4].lower()  # up/down
+            if status != "up":
+                osd_failures.append(osd_name)
+
+        assert not osd_failures, f"Some OSDs are not up: {osd_failures}"
+
+        # Ceph DF basic check
+        assert "SIZE" in ceph_df_res.stdout, "Ceph DF output missing"
+
     except subprocess.CalledProcessError as e:
         pytest.fail(f"Failed to run ceph commands: {e}")
 
     # Ping masters via Kubernetes API
     print("\n=== Ping Master Nodes via API ===")
     core_v1, _ = kube_clients
-    masters = [n.metadata.name for n in core_v1.list_node().items if
-               "control-plane" in n.metadata.labels or "master" in n.metadata.labels]
+    masters = [
+        n.metadata.name
+        for n in core_v1.list_node().items
+        if "control-plane" in n.metadata.labels or "master" in n.metadata.labels
+    ]
 
     unreachable = []
     for m in masters:
         try:
-            # Using kubernetes API instead of raw ping
             node = core_v1.read_node_status(m)
             print(f"Master Node: {m}, conditions retrieved successfully")
         except Exception as e:
