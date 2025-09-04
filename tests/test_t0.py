@@ -81,7 +81,7 @@ def test_network_mtu_and_connectivity(kube_clients):
         try:
             output = subprocess.check_output(["ssh", node_name, "ip link"], text=True)
             for line in output.splitlines():
-                if "mtu" in line:
+                if "mtu" in line and "lo" not in line:
                     mtu = int(line.split("mtu")[1].split()[0])
                     print(f"Node: {node_name}, MTU: {mtu}")
                     if mtu != 1500:  # Adjust per your prod setup
