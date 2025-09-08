@@ -28,6 +28,16 @@ def kube_clients():
     apps_v1 = client.AppsV1Api()
     return core_v1, apps_v1
 
+def parse_dd_output(output: str) -> float:
+    """
+    Parse dd output to extract MB/s throughput.
+    Example line: '524288000 bytes (524 MB, 500 MiB) copied, 1.234 s, 424 MB/s'
+    """
+    for line in output.splitlines():
+        if "copied" in line and "MB/s" in line:
+            return float(line.split(",")[-1].strip().split()[0])
+    return 0.0
+
 def wait_for_pod_running(core_v1, pod_name, namespace, timeout=120):
     for _ in range(timeout):
         pod = core_v1.read_namespaced_pod(pod_name, namespace)
@@ -36,7 +46,6 @@ def wait_for_pod_running(core_v1, pod_name, namespace, timeout=120):
         time.sleep(2)
     raise TimeoutError(f"Pod {pod_name} not running after {timeout} seconds")
 
-@pytest.mark.prod
 def test_single_pod_storage_throughput(kube_clients):
     core_v1, _ = kube_clients
     namespace = "test-rbd-throughput"
@@ -101,6 +110,9 @@ def test_single_pod_storage_throughput(kube_clients):
         "dd", "if=/dev/zero", "of=/data/testfile", "bs=1M", "count=500", "oflag=direct"
     ]).decode()
     print("Write throughput:\n", result_write)
+    write_speed = parse_dd_output(result_write)
+    print("Write throughput MB/s:", write_speed)
+    assert write_speed > 4, "Throughput too low for RBD"  # adjust threshold
 
     # 5. Measure sequential read
     result_read = subprocess.check_output([
@@ -108,8 +120,22 @@ def test_single_pod_storage_throughput(kube_clients):
         "dd", "if=/data/testfile", "of=/dev/null", "bs=1M", "count=500", "iflag=direct"
     ]).decode()
     print("Read throughput:\n", result_read)
+    read_speed = parse_dd_output(result_read)
+    print("Read throughput MB/s:", read_speed)
+    assert read_speed > 4, "Throughput too low for CephFS/RBD"
+
 
 def test_multi_pod_mixed_workload(kube_clients):
+    """
+    T6.2 — Multi-pod mixed workload (Medium)
+    Steps:
+      - 5 pods perform parallel writes (100MB each) to RBD volumes
+      - 5 pods write to shared CephFS
+    Expected:
+      - No timeouts
+      - Latency stable (all writes succeed within threshold)
+      - Ceph backfill/recovery remains idle (no write failures)
+    """
     core_v1, _ = kube_clients
     namespace = "test-mixed-workload"
     rbd_prefix = "rbd-pod"
@@ -185,7 +211,7 @@ def test_multi_pod_mixed_workload(kube_clients):
         except ApiException:
             pass
         # wait pod running
-        for _ in range(30):
+        for _ in range(60):
             pod = core_v1.read_namespaced_pod(pod_name, namespace)
             if pod.status.phase == "Running":
                 return True
@@ -194,21 +220,27 @@ def test_multi_pod_mixed_workload(kube_clients):
 
     # Deploy RBD and CephFS pods in parallel
     with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = []
         for i in range(5):
-            executor.submit(deploy_pod, f"{rbd_prefix}-{i}", f"{pvc_rbd}-{i}")
-            executor.submit(deploy_pod, f"{cephfs_prefix}-{i}", pvc_cephfs)
-    time.sleep(5)
+            futures.append(executor.submit(deploy_pod, f"{rbd_prefix}-{i}", f"{pvc_rbd}-{i}"))
+            futures.append(executor.submit(deploy_pod, f"{cephfs_prefix}-{i}", pvc_cephfs))
+        for f in futures:
+            assert f.result() is True, "Pod failed to reach Running state"
 
     # 5. Write 100MB each in parallel
     def write_100mb(pod_name):
+        start = time.time()
         result = subprocess.run([
             "kubectl", "-n", namespace, "exec", pod_name, "--",
-            "dd", "if=/dev/zero", f"of=/data/{pod_name}_file", "bs=1M", "count=100", "oflag=direct"
+            "dd", "if=/dev/zero", f"of=/data/{pod_name}_file",
+            "bs=1M", "count=100", "oflag=direct"
         ], capture_output=True)
+        latency = time.time() - start
         if result.returncode != 0:
             raise RuntimeError(f"{pod_name} write failed: {result.stderr.decode()}")
-        return result.stdout.decode()
+        return latency, result.stdout.decode()
 
+    latencies = []
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = []
         for i in range(5):
@@ -216,7 +248,13 @@ def test_multi_pod_mixed_workload(kube_clients):
             futures.append(executor.submit(write_100mb, f"{cephfs_prefix}-{i}"))
 
         for f in futures:
-            print(f.result())
+            latency, output = f.result()
+            latencies.append(latency)
+            print(output)
+
+    # 6. Assertions
+    assert all(l < 30 for l in latencies), f"Some writes took too long: {latencies}"
+    assert len(latencies) == 10, "Not all pods completed write"
 
 def test_rbd_capacity_near_full(kube_clients):
     """
@@ -292,6 +330,7 @@ def test_rbd_capacity_near_full(kube_clients):
         raise TimeoutError(f"Pod {pod_name} did not reach Running state")
 
     # 4. Write incrementally to fill >70%
+    write_success = True
     for i in range(1, 6):  # 5 chunks of 1Gi each (adjust as needed)
         print(f"Writing chunk {i} of 1Gi")
         result = subprocess.run([
@@ -300,7 +339,13 @@ def test_rbd_capacity_near_full(kube_clients):
         ], capture_output=True)
         print(result.stdout.decode(), result.stderr.decode())
         if result.returncode != 0:
-            raise RuntimeError(f"Write failed at chunk {i}: {result.stderr.decode()}")
+            write_success = False
+            break
 
-    # 5. Optional: Check Ceph usage and warnings
-    print("Check Ceph pool usage and warnings manually via 'ceph -s' or Ceph dashboard")
+    assert write_success, "Write failed before expected nearfull threshold"
+
+    # Optional: check Ceph health warnings
+    ceph_status = subprocess.check_output(
+        ["kubectl", "-n", "rook-ceph", "exec", "deploy/rook-ceph-tools", "--", "ceph", "df"]).decode()
+    print("Ceph usage:\n", ceph_status)
+    assert "POOL" in ceph_status, "Ceph status not returned"
