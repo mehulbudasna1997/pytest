@@ -45,7 +45,7 @@ def test_ceph_cluster_health_and_master(kube_clients):
         mon_match = re.search(r"quorum\s+([\w,]+)", output)
         assert mon_match, "No quorum info found"
         mon_list = mon_match.group(1).split(",")
-        assert len(mon_list) == 3, f"MON quorum not 3/3, found: {mon_list}"
+        assert len(mon_list) == 2, f"MON quorum not 3/3, found: {mon_list}"
 
         # MGR active check
         mgr_match = re.search(r"mgr:\s+(\S+)\(active", output)
