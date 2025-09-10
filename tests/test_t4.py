@@ -73,7 +73,7 @@ def test_cephfs_rwx_multi_writer(kube_clients):
     namespace = "test-cephfs"
     pvc_name = "cephfs-pvc"
     pod_base_name = "cephfs-pod"
-    storage_class = "rook-cephfs"
+    storage_class = "cephfs"
 
     ns_body = client.V1Namespace(metadata=client.V1ObjectMeta(name=namespace))
 
@@ -262,7 +262,7 @@ def test_cephfs_rwo_multi_attach(kube_clients):
     pvc_name = "cephfs-pvc-rwo"
     pod1_name = "cephfs-pod-1"
     pod2_name = "cephfs-pod-2"
-    storage_class = "rook-ceph-fs"   # CephFS storage class
+    storage_class = "cephfs"   # CephFS storage class
 
     # Create namespace (ignore if exists)
     ns_body = client.V1Namespace(metadata=client.V1ObjectMeta(name=namespace))
