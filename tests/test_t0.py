@@ -108,7 +108,7 @@ def test_time_sync(kube_clients):
                                 stderr=True, stdin=False, stdout=True, tty=False)
                 node_time = int(output.strip())
                 drift = abs(node_time - int(time.time()))
-                time_ok = drift < 10
+                time_ok = drift < 0.5
                 node_reports.append({"name": node_name, "time_sync_ok": time_ok})
                 print(f"Node: {node_name}, Drift: {drift}s, Status: {'OK' if time_ok else 'DRIFT>10s'}")
             except Exception as e:
