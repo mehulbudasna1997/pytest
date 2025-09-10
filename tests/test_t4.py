@@ -81,13 +81,17 @@ def test_cephfs_rwx_multi_writer(kube_clients):
         # 1. Create namespace
         try:
             core_v1.create_namespace(ns_body)
+            print(f"✅ Namespace '{namespace}' created")
         except ApiException as e:
-            if e.status != 409:
+            if e.status == 409:
+                print(f"⚠️ Namespace '{namespace}' already exists, reusing")
+            else:
                 raise
 
         # 2. Delete existing PVC and pods if any
         try:
             core_v1.delete_namespaced_persistent_volume_claim(pvc_name, namespace)
+            print(f"🗑️ Deleted existing PVC '{pvc_name}'")
             time.sleep(3)
         except ApiException as e:
             if e.status != 404:
@@ -97,6 +101,7 @@ def test_cephfs_rwx_multi_writer(kube_clients):
             pod_name = f"{pod_base_name}-{i}"
             try:
                 core_v1.delete_namespaced_pod(pod_name, namespace)
+                print(f"🗑️ Deleted existing Pod '{pod_name}'")
                 time.sleep(2)
             except ApiException as e:
                 if e.status != 404:
@@ -114,7 +119,9 @@ def test_cephfs_rwx_multi_writer(kube_clients):
             }
         }
         core_v1.create_namespaced_persistent_volume_claim(namespace, pvc_manifest)
+        print(f"Created PVC '{pvc_name}', waiting to bind...")
         wait_for_pvc_bound(core_v1, pvc_name, namespace)
+        print(f"PVC '{pvc_name}' is Bound")
 
         # 4. Deploy 3 pods mounting same PVC
         pod_names = []
@@ -138,117 +145,127 @@ def test_cephfs_rwx_multi_writer(kube_clients):
             }
             core_v1.create_namespaced_pod(namespace, pod_manifest)
             pod_names.append(pod_name)
+            print(f"Created Pod '{pod_name}' mounting PVC '{pvc_name}'")
 
+        print("Waiting for all pods to be Running...")
         wait_for_pods_running(core_v1, pod_names, namespace)
+        print("✅ All pods are Running")
 
         # 5. Write from pod-1
+        print(f"Writing test file from {pod_names[0]}...")
         subprocess.run([
             "kubectl", "-n", namespace, "exec", pod_names[0], "--",
             "sh", "-c", "echo 'hello-from-pod1' > /data/testfile"
         ], check=True)
+        print("Write completed in Pod-1")
 
         # 6. Read from pod-2 and pod-3
         for i in range(1, 3):
+            print(f"Reading test file from {pod_names[i]}...")
             output = subprocess.check_output([
                 "kubectl", "-n", namespace, "exec", pod_names[i], "--",
                 "cat", "/data/testfile"
             ]).decode().strip()
-            assert output == "hello-from-pod1", f"Pod {pod_names[i]} read incorrect data: {output}"
+            assert output == "hello-from-pod1", f"❌ Pod {pod_names[i]} read incorrect data: {output}"
+            print(f"Pod {pod_names[i]} read correct data: {output}")
 
         print("CephFS RWX multi-writer test passed: all pods read/write successfully")
 
     finally:
         # Cleanup namespace (deletes PVC + Pods)
+        print(f"Cleaning up: deleting namespace '{namespace}'...")
         try:
             core_v1.delete_namespace(namespace)
         except ApiException as e:
             if e.status != 404:
                 raise
-#
-#
-# def test_cephfs_quota(kube_clients):
-#     core_v1, apps_v1 = kube_clients
-#     namespace = "test-cephfs-quota"
-#     pvc_name = "cephfs-quota-pvc"
-#     pod_name = "cephfs-quota-pod"
-#     storage_class = "cephfs"  # Replace with your CephFS SC name
-#     size_limit = "100Mi"      # Small limit for testing quota
-#
-#     ns_body = client.V1Namespace(metadata=client.V1ObjectMeta(name=namespace))
-#
-#     try:
-#         # 1. Create namespace
-#         try:
-#             core_v1.create_namespace(ns_body)
-#         except ApiException as e:
-#             if e.status != 409:
-#                 raise
-#
-#         # 2. Delete existing PVC & Pod if any
-#         for name, kind in [(pod_name, "pod"), (pvc_name, "pvc")]:
-#             try:
-#                 if kind == "pod":
-#                     core_v1.delete_namespaced_pod(name, namespace)
-#                 else:
-#                     core_v1.delete_namespaced_persistent_volume_claim(name, namespace)
-#                 time.sleep(3)
-#             except ApiException as e:
-#                 if e.status != 404:
-#                     raise
-#
-#         # 3. Create PVC with size limit
-#         pvc_manifest = {
-#             "apiVersion": "v1",
-#             "kind": "PersistentVolumeClaim",
-#             "metadata": {"name": pvc_name},
-#             "spec": {
-#                 "accessModes": ["ReadWriteMany"],
-#                 "resources": {"requests": {"storage": size_limit}},
-#                 "storageClassName": storage_class
-#             }
-#         }
-#         core_v1.create_namespaced_persistent_volume_claim(namespace, pvc_manifest)
-#         wait_for_pvc_bound(core_v1, pvc_name, namespace)
-#
-#         # 4. Create pod mounting PVC
-#         pod_manifest = {
-#             "apiVersion": "v1",
-#             "kind": "Pod",
-#             "metadata": {"name": pod_name},
-#             "spec": {
-#                 "containers": [
-#                     {
-#                         "name": "writer",
-#                         "image": "busybox",
-#                         "command": ["sleep", "3600"],
-#                         "volumeMounts": [{"mountPath": "/data", "name": "cephfs-vol"}]
-#                     }
-#                 ],
-#                 "volumes": [{"name": "cephfs-vol", "persistentVolumeClaim": {"claimName": pvc_name}}]
-#             }
-#         }
-#         core_v1.create_namespaced_pod(namespace, pod_manifest)
-#         wait_for_pod_running(core_v1, pod_name, namespace)
-#
-#         # 5. Attempt to write beyond quota (expect failure)
-#         result = subprocess.run([
-#             "kubectl", "-n", namespace, "exec", pod_name, "--",
-#             "dd", "if=/dev/zero", "of=/data/file", "bs=1M", "count=200", "oflag=direct"
-#         ], capture_output=True, text=True)
-#
-#         print("DD stdout:", result.stdout)
-#         print("DD stderr:", result.stderr)
-#
-#         assert "No space left on device" in result.stderr or result.returncode != 0, \
-#             "Writes succeeded beyond quota! CephFS quota enforcement failed."
-#
-#     finally:
-#         # Cleanup namespace (removes PVCs, Pods automatically)
-#         try:
-#             core_v1.delete_namespace(namespace)
-#         except ApiException as e:
-#             if e.status != 404:
-#                 raise
+        print(f"Namespace '{namespace}' deleted")
+
+
+
+def test_cephfs_quota(kube_clients):
+    core_v1, apps_v1 = kube_clients
+    namespace = "test-cephfs-quota"
+    pvc_name = "cephfs-quota-pvc"
+    pod_name = "cephfs-quota-pod"
+    storage_class = "cephfs"  # Replace with your CephFS SC name
+    size_limit = "100Mi"      # Small limit for testing quota
+
+    ns_body = client.V1Namespace(metadata=client.V1ObjectMeta(name=namespace))
+
+    try:
+        # 1. Create namespace
+        try:
+            core_v1.create_namespace(ns_body)
+        except ApiException as e:
+            if e.status != 409:
+                raise
+
+        # 2. Delete existing PVC & Pod if any
+        for name, kind in [(pod_name, "pod"), (pvc_name, "pvc")]:
+            try:
+                if kind == "pod":
+                    core_v1.delete_namespaced_pod(name, namespace)
+                else:
+                    core_v1.delete_namespaced_persistent_volume_claim(name, namespace)
+                time.sleep(3)
+            except ApiException as e:
+                if e.status != 404:
+                    raise
+
+        # 3. Create PVC with size limit
+        pvc_manifest = {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {"name": pvc_name},
+            "spec": {
+                "accessModes": ["ReadWriteMany"],
+                "resources": {"requests": {"storage": size_limit}},
+                "storageClassName": storage_class
+            }
+        }
+        core_v1.create_namespaced_persistent_volume_claim(namespace, pvc_manifest)
+        wait_for_pvc_bound(core_v1, pvc_name, namespace)
+
+        # 4. Create pod mounting PVC
+        pod_manifest = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": pod_name},
+            "spec": {
+                "containers": [
+                    {
+                        "name": "writer",
+                        "image": "busybox",
+                        "command": ["sleep", "3600"],
+                        "volumeMounts": [{"mountPath": "/data", "name": "cephfs-vol"}]
+                    }
+                ],
+                "volumes": [{"name": "cephfs-vol", "persistentVolumeClaim": {"claimName": pvc_name}}]
+            }
+        }
+        core_v1.create_namespaced_pod(namespace, pod_manifest)
+        wait_for_pod_running(core_v1, pod_name, namespace)
+
+        # 5. Attempt to write beyond quota (expect failure)
+        result = subprocess.run([
+            "kubectl", "-n", namespace, "exec", pod_name, "--",
+            "dd", "if=/dev/zero", "of=/data/file", "bs=1M", "count=200", "oflag=direct"
+        ], capture_output=True, text=True)
+
+        print("DD stdout:", result.stdout)
+        print("DD stderr:", result.stderr)
+
+        assert "No space left on device" in result.stderr or result.returncode != 0, \
+            "Writes succeeded beyond quota! CephFS quota enforcement failed."
+
+    finally:
+        # Cleanup namespace (removes PVCs, Pods automatically)
+        try:
+            core_v1.delete_namespace(namespace)
+        except ApiException as e:
+            if e.status != 404:
+                raise
 #
 #
 # def test_cephfs_rwo_multi_attach(kube_clients):
