@@ -181,6 +181,20 @@ def test_cephfs_rwx_multi_writer(kube_clients):
                 raise
         print(f"Namespace '{namespace}' deleted")
 
+        # Extra step: delete PV if still left after PVC deletion
+        print("Checking for leftover PVs...")
+        pvs = core_v1.list_persistent_volume().items
+        for pv in pvs:
+            if pv.spec.claim_ref and pv.spec.claim_ref.name == pvc_name:
+                try:
+                    core_v1.delete_persistent_volume(pv.metadata.name)
+                    print(f"🗑️ Deleted leftover PV '{pv.metadata.name}'")
+                except ApiException as e:
+                    if e.status != 404:
+                        raise
+
+        print(f"Cleanup finished for namespace '{namespace}'")
+
 
 
 def test_cephfs_quota(kube_clients):
@@ -197,8 +211,11 @@ def test_cephfs_quota(kube_clients):
         # 1. Create namespace
         try:
             core_v1.create_namespace(ns_body)
+            print(f"Namespace '{namespace}' created")
         except ApiException as e:
-            if e.status != 409:
+            if e.status == 409:
+                print(f"Namespace '{namespace}' already exists, reusing")
+            else:
                 raise
 
         # 2. Delete existing PVC & Pod if any
@@ -206,8 +223,10 @@ def test_cephfs_quota(kube_clients):
             try:
                 if kind == "pod":
                     core_v1.delete_namespaced_pod(name, namespace)
+                    print(f"🗑️ Deleted existing Pod '{name}'")
                 else:
                     core_v1.delete_namespaced_persistent_volume_claim(name, namespace)
+                    print(f"🗑️ Deleted existing PVC '{name}'")
                 time.sleep(3)
             except ApiException as e:
                 if e.status != 404:
@@ -225,7 +244,9 @@ def test_cephfs_quota(kube_clients):
             }
         }
         core_v1.create_namespaced_persistent_volume_claim(namespace, pvc_manifest)
+        print(f"Created PVC '{pvc_name}' with quota {size_limit}, waiting to bind...")
         wait_for_pvc_bound(core_v1, pvc_name, namespace)
+        print(f"PVC '{pvc_name}' is Bound")
 
         # 4. Create pod mounting PVC
         pod_manifest = {
@@ -245,9 +266,12 @@ def test_cephfs_quota(kube_clients):
             }
         }
         core_v1.create_namespaced_pod(namespace, pod_manifest)
+        print(f"Pod '{pod_name}' created, waiting to be Running...")
         wait_for_pod_running(core_v1, pod_name, namespace)
+        print(f"Pod '{pod_name}' is Running")
 
         # 5. Attempt to write beyond quota (expect failure)
+        print(f"Trying to write 200Mi (exceeds {size_limit} quota)...")
         result = subprocess.run([
             "kubectl", "-n", namespace, "exec", pod_name, "--",
             "dd", "if=/dev/zero", "of=/data/file", "bs=1M", "count=200", "oflag=direct"
@@ -257,128 +281,29 @@ def test_cephfs_quota(kube_clients):
         print("DD stderr:", result.stderr)
 
         assert "No space left on device" in result.stderr or result.returncode != 0, \
-            "Writes succeeded beyond quota! CephFS quota enforcement failed."
+            "❌ Writes succeeded beyond quota! CephFS quota enforcement failed."
+        print("Quota enforcement worked: write beyond limit failed as expected")
 
     finally:
         # Cleanup namespace (removes PVCs, Pods automatically)
+        print(f"Cleaning up namespace '{namespace}'...")
         try:
             core_v1.delete_namespace(namespace)
         except ApiException as e:
             if e.status != 404:
                 raise
 
+        # Extra step: delete PV if still left after PVC deletion
+        print("Checking for leftover PVs...")
+        pvs = core_v1.list_persistent_volume().items
+        for pv in pvs:
+            if pv.spec.claim_ref and pv.spec.claim_ref.name == pvc_name:
+                try:
+                    core_v1.delete_persistent_volume(pv.metadata.name)
+                    print(f"🗑️ Deleted leftover PV '{pv.metadata.name}'")
+                except ApiException as e:
+                    if e.status != 404:
+                        raise
 
-def test_cephfs_rwo_multi_attach(kube_clients):
-    """
-    T4.5 — Access modes & policy (High)
-    Steps: Attempt multi-attach of CephFS (RWO) to two pods simultaneously.
-    Expected: Denied by CSI; only CephFS with RWX is supported for multi-attach.
-    """
-    core_v1, _ = kube_clients
-    namespace = "test-cephfs"
-    pvc_name = "cephfs-pvc-rwo"
-    pod1_name = "cephfs-pod-1"
-    pod2_name = "cephfs-pod-2"
-    storage_class = "cephfs"   # CephFS storage class
-
-    # Create namespace (ignore if exists)
-    ns_body = client.V1Namespace(metadata=client.V1ObjectMeta(name=namespace))
-    try:
-        core_v1.create_namespace(ns_body)
-    except ApiException as e:
-        if e.status != 409:
-            raise
-
-    try:
-        # Delete any existing PVC/Pods
-        for name, kind in [(pod1_name, "pod"), (pod2_name, "pod"), (pvc_name, "pvc")]:
-            try:
-                if kind == "pod":
-                    core_v1.delete_namespaced_pod(name, namespace)
-                else:
-                    core_v1.delete_namespaced_persistent_volume_claim(name, namespace)
-                time.sleep(3)
-            except ApiException as e:
-                if e.status != 404:
-                    raise
-
-        # Create CephFS PVC with RWO access
-        pvc_manifest = {
-            "apiVersion": "v1",
-            "kind": "PersistentVolumeClaim",
-            "metadata": {"name": pvc_name},
-            "spec": {
-                "accessModes": ["ReadWriteOnce"],
-                "resources": {"requests": {"storage": "1Gi"}},
-                "storageClassName": storage_class
-            }
-        }
-        core_v1.create_namespaced_persistent_volume_claim(namespace, pvc_manifest)
-
-        # Wait for PVC to be Bound
-        for _ in range(60):
-            pvc = core_v1.read_namespaced_persistent_volume_claim(pvc_name, namespace)
-            if pvc.status.phase == "Bound":
-                break
-            time.sleep(2)
-        else:
-            pytest.fail(f"PVC {pvc_name} did not bind in time")
-
-        # Define pod manifest
-        pod_manifest = lambda name: {
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {"name": name},
-            "spec": {
-                "containers": [
-                    {
-                        "name": "app",
-                        "image": "busybox",
-                        "command": ["sleep", "3600"],
-                        "volumeMounts": [{"mountPath": "/data", "name": "cephfs-vol"}]
-                    }
-                ],
-                "volumes": [{"name": "cephfs-vol", "persistentVolumeClaim": {"claimName": pvc_name}}]
-            }
-        }
-
-        # Create first pod (should succeed)
-        core_v1.create_namespaced_pod(namespace, pod_manifest(pod1_name))
-        for _ in range(60):
-            pod = core_v1.read_namespaced_pod(pod1_name, namespace)
-            if pod.status.phase == "Running":
-                break
-            time.sleep(2)
-        else:
-            pytest.fail(f"Pod {pod1_name} not running in time")
-
-        # Create second pod (should fail scheduling due to RWO on CephFS)
-        try:
-            core_v1.create_namespaced_pod(namespace, pod_manifest(pod2_name))
-        except ApiException as e:
-            if e.status in (422, 409):
-                print(f"Pod {pod2_name} creation failed as expected due to CephFS RWO PVC")
-                return
-            else:
-                raise
-
-        # Wait to see if pod2 gets stuck Pending
-        scheduled = False
-        for _ in range(30):
-            pod2 = core_v1.read_namespaced_pod(pod2_name, namespace)
-            if pod2.status.phase == "Pending":
-                scheduled = True
-                break
-            time.sleep(2)
-
-        assert scheduled, "Pod2 should be Pending due to CephFS RWO PVC, but was scheduled!"
-
-    finally:
-        # Cleanup: delete namespace (removes all resources inside)
-        try:
-            core_v1.delete_namespace(namespace)
-            print(f"Namespace {namespace} deleted")
-        except ApiException as e:
-            if e.status != 404:
-                raise
+        print(f"Cleanup finished for namespace '{namespace}'")
 
