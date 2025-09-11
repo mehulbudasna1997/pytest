@@ -36,7 +36,7 @@ def test_metrics_server_running(kube_clients):
     core_v1, _, _ = kube_clients
     namespace = "kube-system"
 
-    pods = core_v1.list_namespaced_pod(namespace=namespace, label_selector="k8s-app=metrics-server")
+    pods = core_v1.list_namespaced_pod(namespace=namespace, label_selector="k8s-app=metrics-server")  ####### Change metrics server name accordingly
     pod_names = [p.metadata.name for p in pods.items]
     print("Metrics-server pods:", pod_names)
 
