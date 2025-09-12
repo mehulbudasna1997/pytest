@@ -76,3 +76,61 @@ def delete_ns(namespace: str, tid: str):
 
 def ensure_ns(namespace: str, tid: str):
     k(f"create ns {namespace} || true", ARTIFACTS_DIR / f"{tid}_ns_create.log", check=False)
+
+def log_step(tid: str, msg: str):
+    """Log step progress to console + artifact file."""
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{tid}] {ts} {msg}"
+    print(line)
+    with open(ARTIFACTS_DIR / f"{tid}_log.txt", "a") as f:
+        f.write(line + "\n")
+
+
+def wait_for_health_ok(timeout=300, interval=10, tid="GENERIC"):
+    """Wait until Ceph cluster reports HEALTH_OK."""
+    start = time.time()
+    while time.time() - start < timeout:
+        status = ceph("status", ARTIFACTS_DIR / f"{tid}_wait_ok.json")
+        if "HEALTH_OK" in status:
+            log_step(tid, "Cluster is HEALTH_OK")
+            return True
+        time.sleep(interval)
+    raise AssertionError(f"[{tid}] Cluster did not reach HEALTH_OK within {timeout}s")
+
+
+def wait_for_health_warn(timeout=120, interval=5, tid="GENERIC"):
+    """Wait until Ceph cluster reports HEALTH_WARN."""
+    start = time.time()
+    while time.time() - start < timeout:
+        status = ceph("status", ARTIFACTS_DIR / f"{tid}_wait_warn.json")
+        if "HEALTH_WARN" in status:
+            log_step(tid, "Cluster entered HEALTH_WARN")
+            return True
+        time.sleep(interval)
+    raise AssertionError(f"[{tid}] Cluster did not enter HEALTH_WARN within {timeout}s")
+
+
+def assert_quorum(min_size=2, tid="GENERIC"):
+    """Assert Ceph quorum has at least `min_size` members."""
+    status = ceph("quorum_status", ARTIFACTS_DIR / f"{tid}_quorum.json")
+    import json
+    try:
+        data = json.loads(status)
+        quorum = data.get("quorum", [])
+        assert len(quorum) >= min_size, f"[{tid}] Quorum size {len(quorum)} < {min_size}"
+        log_step(tid, f"Quorum has {len(quorum)} members (>= {min_size})")
+    except Exception:
+        raise AssertionError(f"[{tid}] Failed to parse quorum_status")
+
+
+def wait_for_rollout(ns: str, deploy: str, timeout=300, tid="GENERIC"):
+    """Wait for a deployment rollout to complete with retries."""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            k(f"rollout status {deploy} -n {ns}", ARTIFACTS_DIR / f"{tid}_{deploy}_rollout.json")
+            log_step(tid, f"Rollout {deploy} completed in ns={ns}")
+            return True
+        except Exception:
+            time.sleep(5)
+    raise AssertionError(f"[{tid}] Rollout {deploy} did not complete in {timeout}s")
