@@ -128,7 +128,7 @@ def test_hpa_cpu_scaling(kube_clients):
     print(f"HPA status: currentReplicas={hpa_status.status.current_replicas}, desiredReplicas={hpa_status.status.desired_replicas}")
     assert hpa_status.status.desired_replicas >= 1, "HPA did not scale deployment as expected"
 
-def test_ceph_rook_logs(kube_client):
+def test_ceph_rook_logs(kube_clients):
     """
     Ensure cluster/system logs are collected and Ceph/Rook events are searchable.
     """
