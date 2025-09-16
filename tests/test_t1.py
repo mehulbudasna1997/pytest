@@ -35,7 +35,6 @@ def test_control_plane_components_prod(kube_clients):
         kubectl -n kube-system get pods -o wide | egrep "kube-(apiserver|controller|scheduler)|kube-proxy"
     Expected:
         - All pods Running
-        - Restarts <= 1
     """
     core_v1, _ = kube_clients
 
@@ -61,9 +60,5 @@ def test_control_plane_components_prod(kube_clients):
         # Fail if pod is not Running
         if pod.status.phase != "Running":
             failures.append(f"{pod.metadata.name} (Status: {pod.status.phase})")
-
-        # Fail if restarts >1
-        # if restarts > 1:
-        #     failures.append(f"{pod.metadata.name} (Restarts: {restarts})")
 
     assert not failures, f"Control plane pod issues: {failures}"

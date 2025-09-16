@@ -196,7 +196,6 @@ def test_cephfs_rwx_multi_writer(kube_clients):
         print(f"Cleanup finished for namespace '{namespace}'")
 
 
-
 def test_cephfs_quota(kube_clients):
     core_v1, apps_v1 = kube_clients
     namespace = "test-cephfs-quota"

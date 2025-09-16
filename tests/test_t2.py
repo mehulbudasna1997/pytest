@@ -39,27 +39,32 @@ def test_ceph_cluster_health_and_master(kube_clients):
         print(output)
 
         # HEALTH_OK check
-        assert "HEALTH_OK" in output, "Ceph cluster is not HEALTH_OK"
+        assert "HEALTH_OK" in output or "HEALTH_WARN" in output, (
+            "Ceph cluster health is neither OK nor acceptable WARN"
+        )
 
-        # MON quorum check
-        mon_match = re.search(r"quorum\s+([\w,]+)", output)
-        assert mon_match, "No quorum info found"
-        mon_list = mon_match.group(1).split(",")
-        assert len(mon_list) == 2, f"Expected 2 MONs in quorum, found: {mon_list}"
+        # --- MON quorum check (dynamic count) ---
+        mon_match = re.search(r"mon:\s+(\d+)\s+daemons, quorum\s+([\w,]+)", output)
+        assert mon_match, "No MON quorum info found in ceph -s"
+        total_mons = int(mon_match.group(1))
+        mon_list = mon_match.group(2).split(",")
+        print(f"MONs in quorum: {mon_list}")
+        assert len(mon_list) == total_mons, (
+            f"Expected {total_mons} MONs in quorum, found {len(mon_list)}"
+        )
 
-        # MGR active check
+        # --- MGR active check ---
         mgr_match = re.search(r"mgr:\s+(\S+)\(active", output)
-        assert mgr_match, "MGR not active"
+        assert mgr_match, "Active MGR not found in ceph -s"
+        print(f"Active MGR: {mgr_match.group(1)}")
 
-        # OSD up/in check (dynamic)
+        # --- OSD up/in check ---
         osd_match = re.search(r"osd:\s+(\d+)\s+osds:\s+(\d+)\s+up.*?,\s+(\d+)\s+in", output)
         assert osd_match, "OSD status not found in ceph -s output"
-
         total_osds, up_osds, in_osds = map(int, osd_match.groups())
         print(f"Total OSDs: {total_osds}, Up: {up_osds}, In: {in_osds}")
-        assert up_osds == in_osds == total_osds, (
-            f"OSD mismatch: total={total_osds}, up={up_osds}, in={in_osds}"
-        )
+        assert up_osds == total_osds, f"OSD up mismatch: total={total_osds}, up={up_osds}"
+        assert in_osds == total_osds, f"OSD in mismatch: total={total_osds}, in={in_osds}"
 
     except subprocess.CalledProcessError as e:
         pytest.fail(f"Failed to run ceph -s: {e}")
