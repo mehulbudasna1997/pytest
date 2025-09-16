@@ -14,3 +14,4 @@ def test_rook_operator_restart():
     k("rollout restart deploy/rook-ceph-operator -n rook-ceph")
 
     wait_for_rollout("rook-ceph", "deploy/rook-ceph-operator", tid=TID)
+    log_step(TID, "PASS: rook-ceph-operator rollout completed successfully")

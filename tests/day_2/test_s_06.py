@@ -20,3 +20,5 @@ def test_ceph_csi_restart():
         log_step(TID, f"Restarting {comp}")
         k(f"rollout restart {comp} -n rook-ceph")
         wait_for_rollout("rook-ceph", comp, tid=TID)
+
+    log_step(TID, "PASS: CSI CephFS components restarted successfully")
