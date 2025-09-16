@@ -75,3 +75,36 @@ def test_csi_drivers_registered(kube_clients):
         assert "cephfs.csi.ceph.com" in output, "cephfs CSI driver not found"
     except subprocess.CalledProcessError as e:
         pytest.fail(f"Failed to get CSI drivers: {e}")
+
+
+# -------------------------
+# T3.3 — Ceph Cluster connection
+# -------------------------
+def test_ceph_cluster_connection():
+    print("\n=== T3.3 — Ceph Cluster Connection ===")
+    try:
+        result = subprocess.run(
+            ["kubectl", "get", "cephcluster", "-n", "rook-ceph"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        output = result.stdout
+        print(output)
+
+        # Look for cluster connection success message
+        assert "Cluster connected successfully" in output, (
+            "CephCluster did not report successful connection"
+        )
+
+        # Health check should be present and OK
+        assert "HEALTH_OK" in output or "HEALTH_WARN" in output, (
+            "CephCluster health not OK/WARN"
+        )
+
+        # Verify PHASE is Connected
+        assert "Connected" in output, "CephCluster phase is not Connected"
+
+    except subprocess.CalledProcessError as e:
+        pytest.fail(f"Failed to get cephcluster: {e}")
+
