@@ -4,16 +4,16 @@ import subprocess
 from pathlib import Path
 import pytest
 import paramiko
+import os
 
-TID = "N03"
+TID = "N01"
 ARTIFACTS_DIR = Path("artifacts")
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 TEST_NS = "test-cephfs"
 
-# SSH config (fill in your values)
-SSH_USER = "ubuntu"            # change as per your cluster node
-SSH_PASS = "yourpassword"      # or fetch from ENV
-SSH_PORT = 22
+SSH_USER = os.environ.get("SSH_USER")  # SSH username
+SSH_PASS = os.environ.get("SSH_PASS")  # SSH password
+SSH_PORT = int(os.environ.get("SSH_PORT", 22))
 
 
 def run_cmd(cmd: str, out_file: Path, check=True) -> str:
@@ -54,90 +54,101 @@ def ceph(cmd: str, out_file: Path, check=True) -> str:
     return run_cmd(f"ceph {cmd}", out_file, check=check)
 
 
-def ssh_restart_kubelet(node_ip: str):
-    """SSH into node and restart kubelet service."""
+def ssh_reboot_node(node_ip: str):
+    """SSH into node and reboot gracefully."""
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(node_ip, port=SSH_PORT, username=SSH_USER, password=SSH_PASS)
 
-    stdin, stdout, stderr = client.exec_command("sudo -S systemctl restart kubelet\n")
+    # Run reboot
+    stdin, stdout, stderr = client.exec_command("sudo -S reboot")
     stdin.write(f"{SSH_PASS}\n")
     stdin.flush()
 
     out = stdout.read().decode()
     err = stderr.read().decode()
+    print(f"⚡ SSH reboot sent to {node_ip}. STDOUT:\n{out}\nSTDERR:\n{err}")
+
     client.close()
 
-    log_path = ARTIFACTS_DIR / f"{TID}_kubelet_restart.log"
-    log_path.write_text(out + err)
-    if err and "Failed" in err:
-        pytest.fail(f"Kubelet restart failed: {err}")
-    return out
+
+def is_node_ready(node_name: str) -> bool:
+    """Check if node Ready condition is True."""
+    out = run_cmd(f"kubectl get node {node_name} -o json",
+                  ARTIFACTS_DIR / f"{TID}_node.json")
+    data = json.loads(out)
+    for cond in data.get("status", {}).get("conditions", []):
+        if cond["type"] == "Ready":
+            return cond["status"] == "True"
+    return False
 
 
-def test_kubelet_restart_worker():
-    """
-    Objective:
-        Verify CephFS workloads tolerate kubelet restart.
+@pytest.mark.high
+def test_worker_node_reboot_graceful():
+    """N-01: Worker node reboot (graceful)"""
 
-    Steps:
-        1. Identify CephFS tester pod + node
-        2. Collect baseline evidence
-        3. Restart kubelet via SSH
-        4. Wait for pod recovery
-        5. Validate data intact
-        6. Collect post-restart evidence
-
-    Expected:
-        - Pod recovers within 3 minutes
-        - No data loss in CephFS
-        - Ceph cluster stays healthy
-    """
     # 1. Find CephFS tester pod + node
     pods = get_pod_names_by_label(TEST_NS, "app=cephfs-tester", TID, "pods")
     assert pods, "No CephFS tester pod found"
     pod_name = pods[0]
 
-    out = run_cmd(
-        f"kubectl -n {TEST_NS} get pod {pod_name} -o wide",
-        ARTIFACTS_DIR / f"{TID}_pod_info.log"
-    )
+    out = run_cmd(f"kubectl -n {TEST_NS} get pod {pod_name} -o wide",
+                  ARTIFACTS_DIR / f"{TID}_pod_info.log")
     node_name = out.splitlines()[1].split()[6]  # NODE column
     node_ip = run_cmd(
         f"kubectl get node {node_name} -o jsonpath='{{.status.addresses[?(@.type==\"InternalIP\")].address}}'",
         ARTIFACTS_DIR / f"{TID}_node_ip.log"
     ).strip()
 
+    print(f"⚡ Selected pod {pod_name} on node {node_name} ({node_ip})")
+
     # 2. Baseline evidence
     run_cmd("kubectl get nodes -o wide", ARTIFACTS_DIR / f"{TID}_nodes_before.log")
     ceph("status", ARTIFACTS_DIR / f"{TID}_ceph_before.log")
     exec_in_pod(TEST_NS, pod_name, "md5sum /mnt/cephfs/testfile.txt", TID, "md5_before", check=False)
 
-    # 3. Restart kubelet on worker node via SSH
-    print(f"⚡ Restarting kubelet on {node_name} ({node_ip})...")
-    ssh_restart_kubelet(node_ip)
+    # 3. Drain node gracefully
+    run_cmd(f"kubectl drain {node_name} --ignore-daemonsets --delete-emptydir-data --force --grace-period=30",
+            ARTIFACTS_DIR / f"{TID}_drain.log")
+    print(f"Node {node_name} drained")
 
-    # 4. Wait for pod recovery
+    # 4. Reboot node via SSH
+    print(f"Rebooting node {node_name} ({node_ip}) via SSH...")
+    ssh_reboot_node(node_ip)
+
+    # 5. Wait for node Ready (max 5 min)
     start = time.time()
+    node_ready = False
+    while time.time() - start < 300:
+        if is_node_ready(node_name):
+            node_ready = True
+            break
+        time.sleep(10)
+    assert node_ready, f"Node {node_name} did not become Ready within 5 min"
+
+    # 6. Uncordon node
+    run_cmd(f"kubectl uncordon {node_name}", ARTIFACTS_DIR / f"{TID}_uncordon.log")
+
+    # 7. Verify pod rescheduled
     recovered = False
-    while time.time() - start < 180:  # 3 min
-        pods_status = run_cmd(
-            f"kubectl -n {TEST_NS} get pod {pod_name}",
-            ARTIFACTS_DIR / f"{TID}_pod_status.log"
-        )
-        if "Running" in pods_status and "0/1" not in pods_status:
+    start = time.time()
+    new_pod = pod_name
+    while time.time() - start < 120:
+        pods_after = get_pod_names_by_label(TEST_NS, "app=cephfs-tester", TID, "pods_after")
+        if pods_after and pods_after[0] != pod_name:
             recovered = True
+            new_pod = pods_after[0]
             break
         time.sleep(5)
-    assert recovered, f"Pod {pod_name} did not recover after kubelet restart"
+    assert recovered, "Pod did not reschedule to another node within 120s"
 
-    # 5. Data check
-    out = exec_in_pod(TEST_NS, pod_name, "cat /mnt/cephfs/testfile.txt", TID, "md5_after", check=False)
-    assert "cephfs test OK" in out, "CephFS data lost after kubelet restart"
+    # 8. Verify data intact
+    out = exec_in_pod(TEST_NS, new_pod, "cat /mnt/cephfs/testfile.txt", TID, "md5_after", check=False)
+    assert "cephfs test OK" in out, "CephFS data lost after node reboot"
 
-    # 6. Post-restart evidence
+    # 9. Post-reboot evidence
     run_cmd("kubectl get nodes -o wide", ARTIFACTS_DIR / f"{TID}_nodes_after.log")
     run_cmd(f"kubectl -n {TEST_NS} get pods -o wide", ARTIFACTS_DIR / f"{TID}_pods_after.log")
     ceph("status", ARTIFACTS_DIR / f"{TID}_ceph_after.log")
 
-    print("✅ Automated kubelet restart test passed! Pod healthy, CephFS intact.")
+    print("✅ Worker node reboot (graceful) test passed! Pod healthy and CephFS intact.")
