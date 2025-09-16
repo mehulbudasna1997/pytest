@@ -132,7 +132,7 @@ def test_ceph_rook_logs(kube_clients):
     """
     Ensure cluster/system logs are collected and Ceph/Rook events are searchable.
     """
-    core_v1, _, _ = kube_client
+    core_v1, _, _ = kube_clients
 
     # Get events from all namespaces
     events = core_v1.list_event_for_all_namespaces().items
