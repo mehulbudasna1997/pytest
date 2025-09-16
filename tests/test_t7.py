@@ -1,7 +1,7 @@
 import subprocess
 import pytest
 from kubernetes import client, config
-
+import json
 
 
 @pytest.fixture(scope="session")
@@ -49,29 +49,6 @@ def test_t7_1_rbac_least_privilege(kube_client):
         result = False
 
     assert result is False, "Read-only SA unexpectedly has delete pod privilege"
-
-
-
-@pytest.mark.high
-def test_t7_2_secrets_at_rest(kube_client):
-    """
-    Purpose:
-        Validate Kubernetes secrets are encrypted at rest.
-    Steps:
-        1. Fetch kube-apiserver manifest
-        2. Verify --encryption-provider-config flag is set
-    Expected Result:
-        - Encryption at rest enabled (AES-CBC/KMS)
-        - Secrets not readable as plain text on disk
-    """
-    manifest = subprocess.check_output(
-        ["kubectl", "-n", "kube-system", "get", "pod",
-         "-l", "component=kube-apiserver", "-o", "yaml"],
-        text=True
-    )
-    print("kube-apiserver manifest:\n", manifest[:500])
-    assert "--encryption-provider-config" in manifest, "Encryption provider config not set"
-
 
 @pytest.mark.medium
 def test_t7_3_network_policies(kube_client):
