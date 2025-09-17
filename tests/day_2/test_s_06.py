@@ -96,5 +96,4 @@ def test_ceph_csi_restart_resilience():
     # Step 6: Collect evidence
     run_ssh_cmd(f"kubectl -n {ROOK_NS} get pods -o wide",
                 ARTIFACTS_DIR / f"{TID}_csi_pods_after.log")
-
     print("✅ Ceph-CSI restart test passed (S-06)")
