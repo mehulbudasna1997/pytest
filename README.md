@@ -146,7 +146,7 @@ def test_example_scenario():
 
 This suite currently covers:
 
-- **T5.1** Worker node reboot + pod reschedule validation  
+- **T7** Worker node reboot + pod reschedule validation  
 - CSI restarts (S-series)  
 - PVC expansion under load  
 - Snapshot & restore verification  
