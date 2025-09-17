@@ -3,13 +3,20 @@ import subprocess
 import time
 import pytest
 from kubernetes import client, config
+import paramiko
+from pathlib import Path
 
 # Configurable
 TEST_NAMESPACE = os.environ.get("TEST_NAMESPACE", "test-cephfs")
-SSH_USER = os.environ.get("SSH_USER", None)
+SSH_USER = os.environ.get("SSH_USER")
+SSH_PASS = os.environ.get("SSH_PASS")
+SSH_PORT = int(os.environ.get("SSH_PORT", 22))
 WAIT_READY_TIMEOUT = 600   # seconds
 WAIT_NOTREADY_TIMEOUT = 180
 POLL_INTERVAL = 5
+
+ARTIFACTS_DIR = Path("artifacts")
+ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def run_cmd(cmd: str, check: bool = True) -> str:
@@ -51,8 +58,32 @@ def wait_for_status(v1, node_name: str, target: str, timeout: int) -> bool:
     return False
 
 
+def reboot_node_via_ssh(host: str):
+    """Reboot a node via SSH using paramiko (env SSH_USER/SSH_PASS)."""
+    print(f"[SSH] Connecting to {host}:{SSH_PORT} as {SSH_USER}")
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(host, port=SSH_PORT, username=SSH_USER, password=SSH_PASS)
+
+    stdin, stdout, stderr = client.exec_command("sudo -S reboot\n")
+    if SSH_PASS:
+        try:
+            stdin.write(f"{SSH_PASS}\n")
+            stdin.flush()
+        except Exception:
+            pass
+
+    out = stdout.read().decode()
+    err = stderr.read().decode()
+    client.close()
+
+    log_path = ARTIFACTS_DIR / "T51_reboot.log"
+    log_path.write_text(out + err)
+    print(f"[SSH] Reboot command sent to {host}, log saved to {log_path}")
+
+
 @pytest.mark.phase5
-def test_t5_worker_node_reboot(session):
+def test_t5_worker_node_reboot():
     """
     Phase 5 — Resilience & Failure Drills
     T5.1 — Reboot a worker hosting app pod (High)
@@ -60,7 +91,7 @@ def test_t5_worker_node_reboot(session):
     Steps:
     1. Identify a worker node hosting an app pod.
     2. Drain the node.
-    3. Reboot the node.
+    3. Reboot the node via SSH.
     4. Wait for node to go NotReady → Ready.
     5. Uncordon the node.
     6. Verify pods rescheduled successfully and PVCs reattached.
@@ -79,16 +110,14 @@ def test_t5_worker_node_reboot(session):
     # Step 2: Drain the node
     run_cmd(f"kubectl drain {node_name} --ignore-daemonsets --delete-emptydir-data --force")
 
-    # Step 3: Reboot the node via SSH
+    # Step 3: Reboot the node via SSH (resolve InternalIP)
     node_ip = None
     for addr in v1.read_node(node_name).status.addresses:
         if addr.type == "InternalIP":
             node_ip = addr.address
             break
-    ssh_target = node_ip or node_name
-    if SSH_USER:
-        ssh_target = f"{SSH_USER}@{ssh_target}"
-    run_cmd(f"ssh -o BatchMode=yes -o ConnectTimeout=8 {ssh_target} 'sudo reboot' &", check=False)
+    assert node_ip, f"No InternalIP found for node {node_name}"
+    reboot_node_via_ssh(node_ip)
 
     # Step 4: Wait for node to go NotReady then Ready
     print("[INFO] Waiting for node to go NotReady...")
@@ -109,7 +138,6 @@ def test_t5_worker_node_reboot(session):
     print(f"[PASS] All pods in namespace {TEST_NAMESPACE} are running and Ready.")
 
     # Step 7: ping check
-    if node_ip:
-        rc = os.system(f"ping -c 3 -W 2 {node_ip} > /dev/null 2>&1")
-        assert rc == 0, f"Ping to node {node_ip} failed"
-        print(f"[PASS] Node {node_name} reachable via ping at {node_ip}")
+    rc = os.system(f"ping -c 3 -W 2 {node_ip} > /dev/null 2>&1")
+    assert rc == 0, f"Ping to node {node_ip} failed"
+    print(f"[PASS] Node {node_name} reachable via ping at {node_ip}")
