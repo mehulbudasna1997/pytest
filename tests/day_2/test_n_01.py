@@ -12,7 +12,7 @@ ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 TEST_NS = "test-cephfs"
 SSH_USER = os.environ.get("SSH_USER")  # SSH username
 SSH_PASS = os.environ.get("SSH_PASS")  # SSH password
-SSH_PORT = int(os.environ.get("SSH_PORT", 22))
+SSH_PORT = int(os.environ.get("SSH_PORT"))
 
 
 def ssh_reboot_kubelet(node_ip: str):
