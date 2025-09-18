@@ -4,12 +4,16 @@ import subprocess
 from pathlib import Path
 import pytest
 import paramiko
-
+import os
 
 TID = "N01"
 ARTIFACTS_DIR = Path("artifacts")
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 TEST_NS = "test-cephfs"
+SSH_USER = os.environ.get("SSH_USER")  # SSH username
+SSH_PASS = os.environ.get("SSH_PASS")  # SSH password
+SSH_PORT = int(os.environ.get("SSH_PORT", 22))
+
 
 def ssh_reboot_kubelet(node_ip: str):
     """SSH into node and restart kubelet service."""
