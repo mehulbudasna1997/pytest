@@ -12,9 +12,9 @@ ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 TEST_NS = "test-cephfs"
 
 # SSH credentials from environment variables
-SSH_USER = os.environ.get("SSH_USER", "ubuntu")
-SSH_PASS = os.environ.get("SSH_PASS", "")
-SSH_PORT = int(os.environ.get("SSH_PORT", 22))
+SSH_USER = os.environ.get("SSH_USER")
+SSH_PASS = os.environ.get("SSH_PASS")
+SSH_PORT = int(os.environ.get("SSH_PORT"))
 
 # Utility to run local shell commands
 def run_cmd(cmd: str, out_file: Path, check=True) -> str:
