@@ -16,7 +16,7 @@ TEST_NS = "test-cephfs"
 # SSH credentials from environment variables
 SSH_USER = os.environ.get("SSH_USER")
 SSH_PASS = os.environ.get("SSH_PASS")
-SSH_PORT = int(os.environ.get("SSH_PORT", "22"))
+SSH_PORT = int(os.environ.get("SSH_PORT"))
 
 # ---------- Logger ----------
 def log(msg: str):
